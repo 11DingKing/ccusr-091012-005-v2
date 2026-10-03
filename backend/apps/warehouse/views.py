@@ -10,14 +10,23 @@ from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from apps.core.response import success_response, error_response
-from .models import Unit, Category, Variety, Goods, StockIn, StockOut, Warning, Approval
+from .models import (
+    Unit, Category, Variety, Goods, StockIn, StockOut, Warning, Approval,
+    QuarantineCase, QuarantineDecision,
+)
 from .serializers import (
     UnitSerializer, UnitCreateSerializer,
     CategorySerializer, CategoryCreateSerializer,
     VarietySerializer, VarietyCreateSerializer,
     GoodsSerializer, StockInSerializer, StockOutSerializer,
-    WarningSerializer, ApprovalSerializer
+    WarningSerializer, ApprovalSerializer,
+    QuarantineCaseSerializer, QuarantineCaseDetailSerializer,
+    QuarantineCaseCreateSerializer,
+    QuarantineInspectionSerializer, QuarantineInspectionCreateSerializer,
+    QuarantineDecisionSerializer, QuarantineDecisionCreateSerializer,
+    StockInCreateSerializer, StockOutCreateSerializer, GoodsTransferSerializer,
 )
+from . import services
 
 logger = logging.getLogger('apps')
 
@@ -573,43 +582,322 @@ class DashboardView(APIView):
         })
 
 
+# ==================== 货物与收发 ====================
+
+def _paginate(queryset, request):
+    """通用分页"""
+    page = int(request.query_params.get('page', 1))
+    page_size = int(request.query_params.get('page_size', 10))
+    start = (page - 1) * page_size
+    end = start + page_size
+    return queryset.count(), queryset[start:end], page, page_size
+
+
 class GoodsListView(APIView):
     """货物列表视图"""
     permission_classes = [IsAuthenticated]
-    
+
     def get(self, request):
+        queryset = Goods.objects.select_related(
+            'variety__category__unit'
+        ).order_by('-created_at')
+
+        keyword = request.query_params.get('keyword')
+        if keyword:
+            queryset = queryset.filter(name__icontains=keyword) | queryset.filter(code__icontains=keyword)
+        if request.query_params.get('quarantined') == 'true':
+            queryset = queryset.filter(quarantined_quantity__gt=0)
+
+        total, goods_list, page, page_size = _paginate(queryset, request)
+        serializer = GoodsSerializer(goods_list, many=True)
         return success_response(data={
-            'list': [],
-            'total': 0,
-            'page': 1,
-            'page_size': 10
+            'list': serializer.data,
+            'total': total,
+            'page': page,
+            'page_size': page_size
         })
+
+
+class GoodsTransferView(APIView):
+    """货物转移库位（存在有效隔离时阻断）"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        serializer = GoodsTransferSerializer(data=request.data)
+        if not serializer.is_valid():
+            first_error = list(serializer.errors.values())[0][0]
+            return error_response(message=str(first_error))
+
+        goods = services.transfer_goods(
+            goods_id=pk,
+            location=serializer.validated_data['location'],
+            remark=serializer.validated_data.get('remark', ''),
+            user=request.user,
+        )
+        return success_response(
+            data=GoodsSerializer(goods).data,
+            message='转移成功'
+        )
 
 
 class StockInListView(APIView):
-    """入库记录列表视图"""
+    """入库记录视图"""
     permission_classes = [IsAuthenticated]
-    
+
     def get(self, request):
+        queryset = StockIn.objects.select_related('goods', 'operator')
+        goods_id = request.query_params.get('goods_id')
+        if goods_id:
+            queryset = queryset.filter(goods_id=goods_id)
+
+        total, records, page, page_size = _paginate(queryset, request)
+        serializer = StockInSerializer(records, many=True)
         return success_response(data={
-            'list': [],
-            'total': 0,
-            'page': 1,
-            'page_size': 10
+            'list': serializer.data,
+            'total': total,
+            'page': page,
+            'page_size': page_size
         })
+
+    def post(self, request):
+        """入库登记"""
+        serializer = StockInCreateSerializer(data=request.data)
+        if not serializer.is_valid():
+            first_error = list(serializer.errors.values())[0][0]
+            return error_response(message=str(first_error))
+
+        data = serializer.validated_data
+        stock_in = services.register_stock_in(
+            goods_id=data['goods'],
+            quantity=data['quantity'],
+            batch_no=data.get('batch_no', ''),
+            supplier=data.get('supplier', ''),
+            remark=data.get('remark', ''),
+            user=request.user,
+        )
+        return success_response(
+            data=StockInSerializer(stock_in).data,
+            message='入库成功'
+        )
 
 
 class StockOutListView(APIView):
-    """出库记录列表视图"""
+    """出库（领用）记录视图"""
     permission_classes = [IsAuthenticated]
-    
+
     def get(self, request):
+        queryset = StockOut.objects.select_related('goods', 'operator')
+        goods_id = request.query_params.get('goods_id')
+        if goods_id:
+            queryset = queryset.filter(goods_id=goods_id)
+        status_param = request.query_params.get('status')
+        if status_param:
+            queryset = queryset.filter(status=status_param)
+
+        total, records, page, page_size = _paginate(queryset, request)
+        serializer = StockOutSerializer(records, many=True)
         return success_response(data={
-            'list': [],
-            'total': 0,
-            'page': 1,
-            'page_size': 10
+            'list': serializer.data,
+            'total': total,
+            'page': page,
+            'page_size': page_size
         })
+
+    def post(self, request):
+        """领用登记（存在有效隔离时，隔离数量不可领用）"""
+        serializer = StockOutCreateSerializer(data=request.data)
+        if not serializer.is_valid():
+            first_error = list(serializer.errors.values())[0][0]
+            return error_response(message=str(first_error))
+
+        data = serializer.validated_data
+        stock_out = services.register_stock_out(
+            goods_id=data['goods'],
+            quantity=data['quantity'],
+            receiver=data['receiver'],
+            receiver_dept=data.get('receiver_dept', ''),
+            remark=data.get('remark', ''),
+            user=request.user,
+        )
+        return success_response(
+            data=StockOutSerializer(stock_out).data,
+            message='领用成功'
+        )
+
+
+# ==================== 隔离处置 ====================
+
+class QuarantineCaseListView(APIView):
+    """隔离处置案件列表与创建"""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        queryset = QuarantineCase.objects.select_related('goods', 'found_by')
+        goods_id = request.query_params.get('goods_id')
+        if goods_id:
+            queryset = queryset.filter(goods_id=goods_id)
+        status_param = request.query_params.get('status')
+        if status_param:
+            queryset = queryset.filter(status=status_param)
+        reason = request.query_params.get('reason')
+        if reason:
+            queryset = queryset.filter(reason=reason)
+
+        total, cases, page, page_size = _paginate(queryset, request)
+        serializer = QuarantineCaseSerializer(cases, many=True)
+        return success_response(data={
+            'list': serializer.data,
+            'total': total,
+            'page': page,
+            'page_size': page_size
+        })
+
+    def post(self, request):
+        """建立隔离处置案件"""
+        serializer = QuarantineCaseCreateSerializer(data=request.data)
+        if not serializer.is_valid():
+            first_error = list(serializer.errors.values())[0][0]
+            return error_response(message=str(first_error))
+
+        data = serializer.validated_data
+        case = services.create_quarantine_case(
+            goods_id=data['goods'],
+            quantity=data['quantity'],
+            reason=data['reason'],
+            reason_detail=data.get('reason_detail', ''),
+            stock_in_id=data.get('stock_in'),
+            quarantine_location=data.get('quarantine_location') or '隔离区',
+            remark=data.get('remark', ''),
+            user=request.user,
+        )
+        return success_response(
+            data=QuarantineCaseSerializer(case).data,
+            message='隔离案件已建立'
+        )
+
+
+class QuarantineCaseDetailView(APIView):
+    """隔离案件详情：复检、决定、流水与每一数量单位的处置状态"""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        try:
+            case = QuarantineCase.objects.select_related(
+                'goods', 'found_by'
+            ).prefetch_related(
+                'inspections', 'decisions', 'movements'
+            ).get(pk=pk)
+        except QuarantineCase.DoesNotExist:
+            return error_response(message='隔离案件不存在', code=404)
+
+        return success_response(data=QuarantineCaseDetailSerializer(case).data)
+
+
+class QuarantineInspectionListView(APIView):
+    """隔离案件复检记录"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, case_id):
+        """登记复检记录"""
+        serializer = QuarantineInspectionCreateSerializer(data=request.data)
+        if not serializer.is_valid():
+            first_error = list(serializer.errors.values())[0][0]
+            return error_response(message=str(first_error))
+
+        inspection = services.add_inspection(
+            case_id=case_id,
+            result=serializer.validated_data['result'],
+            conclusion=serializer.validated_data['conclusion'],
+            user=request.user,
+        )
+        return success_response(
+            data=QuarantineInspectionSerializer(inspection).data,
+            message='复检记录已登记'
+        )
+
+
+class QuarantineDecisionListView(APIView):
+    """隔离处置决定列表与申请"""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        queryset = QuarantineDecision.objects.select_related(
+            'case', 'case__goods', 'proposed_by', 'approver'
+        )
+        case_id = request.query_params.get('case_id')
+        if case_id:
+            queryset = queryset.filter(case_id=case_id)
+        status_param = request.query_params.get('status')
+        if status_param:
+            queryset = queryset.filter(status=status_param)
+
+        total, decisions, page, page_size = _paginate(queryset, request)
+        serializer = QuarantineDecisionSerializer(decisions, many=True)
+        return success_response(data={
+            'list': serializer.data,
+            'total': total,
+            'page': page,
+            'page_size': page_size
+        })
+
+    def post(self, request, case_id=None):
+        """提出处置决定"""
+        serializer = QuarantineDecisionCreateSerializer(data=request.data)
+        if not serializer.is_valid():
+            first_error = list(serializer.errors.values())[0][0]
+            return error_response(message=str(first_error))
+
+        data = serializer.validated_data
+        decision = services.propose_decision(
+            case_id=case_id or request.data.get('case'),
+            decision_type=data['decision_type'],
+            quantity=data['quantity'],
+            reason=data.get('reason', ''),
+            user=request.user,
+        )
+        return success_response(
+            data=QuarantineDecisionSerializer(decision).data,
+            message='处置决定已提交，待审批'
+        )
+
+
+class QuarantineDecisionReviewView(APIView):
+    """审批隔离处置决定（通过即执行库存移动）"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        approve = request.data.get('approve')
+        if approve is None:
+            return error_response(message='请给出审批结论')
+        opinion = request.data.get('opinion', '')
+
+        decision = services.review_decision(
+            decision_id=pk,
+            approve=bool(approve),
+            opinion=opinion,
+            user=request.user,
+        )
+        message = '决定已执行' if decision.status == 'approved' else '决定已拒绝'
+        return success_response(
+            data=QuarantineDecisionSerializer(decision).data,
+            message=message
+        )
+
+
+class QuarantineDecisionRevokeView(APIView):
+    """撤销已执行的处置决定（生成反向流水，不删除历史）"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        decision = services.revoke_decision(
+            decision_id=pk,
+            reason=request.data.get('reason', ''),
+            user=request.user,
+        )
+        return success_response(
+            data=QuarantineDecisionSerializer(decision).data,
+            message='决定已撤销，已生成反向动作'
+        )
 
 
 class WarningListView(APIView):
